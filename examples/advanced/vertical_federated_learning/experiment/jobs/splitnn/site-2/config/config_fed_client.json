@@ -1,0 +1,37 @@
+{
+    "format_version": 2,
+    "executors": [
+        {
+            "tasks": [
+                "_splitnn_task_init_model_",
+                "_splitnn_task_train_"
+            ],
+            "executor": {
+                "id": "Executor",
+                "path": "nvflare.app_common.executors.splitnn_learner_executor.SplitNNLearnerExecutor",
+                "args": {
+                    "learner_id": "splitnn-learner"
+                }
+            }
+        }
+    ],
+    "task_result_filters": [],
+    "task_data_filters": [],
+    "components": [
+        {
+            "id": "splitnn-learner",
+            "path": "src.vfl.split_nn_learner.SplitNNLearner",
+            "args": {
+                "dataset_root": "/tmp/nvflare/vertical_data/site-x/",
+                "intersection_file": "/tmp/nvflare/vertical_psi/simulate_job/site-1/psi/intersection.txt",
+                "lr": 0.01,
+                "model": {
+                    "path": "src.vfl.split_nn.SplitNN",
+                    "args": {
+                        "split_id": 1
+                    }
+                }
+            }
+        }
+    ]
+}

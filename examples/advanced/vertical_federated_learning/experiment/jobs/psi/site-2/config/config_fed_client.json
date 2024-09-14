@@ -27,7 +27,7 @@
       "path": "src.local_psi.LocalPSI",
       "args": {
         "psi_writer_id": "psi_writer",
-        "data_split_path": "/tmp/nvflare/vertical_xgb_data/site-2/bank.data.csv",
+        "data_split_path": "/tmp/nvflare/vertical_data/site-2/bank.data.csv",
         "id_col": "uid"
       }
     },

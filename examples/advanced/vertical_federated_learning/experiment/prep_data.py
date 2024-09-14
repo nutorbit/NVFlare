@@ -46,5 +46,35 @@ def main():
         df_split.to_csv(path_or_buf=os.path.join(data_path, output_file), index=False)
 
 
+def main2():
+    data_path = "./data/bank.csv"
+    output_path="/tmp/nvflare/vertical_data"
+    output_file="bank.data.csv"
+    
+    if os.path.exists(output_path):
+        shutil.rmtree(output_path)
+    
+    train_1 = np.load("./data/train_0.npy")
+    train_0 = np.load("./data/train_1.npy")
+    
+    df_train_0 = pd.DataFrame(train_0)
+    df_train_1 = pd.DataFrame(train_1)
+    
+    df_train_0["uid"] = df_train_0.index.to_series().map(lambda x: "uid_" + str(x))
+    df_train_1["uid"] = df_train_1.index.to_series().map(lambda x: "uid_" + str(x))
+    
+    data_path_0 = os.path.join(output_path, f"site-1")
+    data_path_1 = os.path.join(output_path, f"site-2")
+    
+    if not os.path.exists(data_path_0):
+        os.makedirs(data_path_0, exist_ok=True)
+        
+    if not os.path.exists(data_path_1):
+        os.makedirs(data_path_1, exist_ok=True)
+        
+    df_train_0.to_csv(path_or_buf=os.path.join(data_path_0, output_file), index=False)
+    df_train_1.to_csv(path_or_buf=os.path.join(data_path_1, output_file), index=False)
+
+
 if __name__ == "__main__":
-    main()
+    main2()
