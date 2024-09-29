@@ -18,6 +18,29 @@ import shutil
 import numpy as np
 import pandas as pd
 
+from sklearn.preprocessing import StandardScaler
+
+
+def normalize_except_first(data):
+  """
+  Normalizes all features in the given data except the first one using StandardScaler.
+
+  Args:
+    data: A numpy array where each row represents a sample and each column a feature.
+
+  Returns:
+    A new numpy array with the same shape as the input, where all features except the 
+    first one are normalized.
+  """
+
+  scaler = StandardScaler()
+  scaler.fit(data[:, 1:])  
+
+  normalized_data = data.copy()
+  normalized_data[:, 1:] = scaler.transform(data[:, 1:])
+
+  return normalized_data
+
 
 def main():
     data_path = "./data/bank.csv"
@@ -57,8 +80,8 @@ def main2():
     train_1 = np.load("./data/train_0.npy")
     train_0 = np.load("./data/train_1.npy")
     
-    df_train_0 = pd.DataFrame(train_0)
-    df_train_1 = pd.DataFrame(train_1)
+    df_train_0 = pd.DataFrame(normalize_except_first(train_0))
+    df_train_1 = pd.DataFrame(normalize_except_first(train_1))
     
     df_train_0["uid"] = df_train_0.index.to_series().map(lambda x: "uid_" + str(x))
     df_train_1["uid"] = df_train_1.index.to_series().map(lambda x: "uid_" + str(x))
