@@ -11,6 +11,7 @@ from nvflare.apis.dxo import DXO, from_shareable
 from nvflare.app_common.abstract.learner_spec import Learner
 from nvflare.app_opt.pt.decomposers import TensorDecomposer
 from nvflare.apis.fl_context import FLContext
+from torch.utils.tensorboard import SummaryWriter
 from nvflare.apis.fl_constant import FLContextKey, ReturnCode
 from nvflare.apis.shareable import Shareable, make_reply
 from nvflare.app_common.app_constant import AppConstants
@@ -40,6 +41,7 @@ class SplitNNConstants:
     TASK_TRAIN_SCB_STEP = "_splitnn_task_train_scb_step_"
     TASK_TRAIN_CARDX_STEP = "_splitnn_task_train_cardx_step_"
     TASK_TRAIN = "_splitnn_task_train_"
+    TASK_VALID_LABEL_STEP = "_splitnn_task_val_scb_step_"
     
     TIMEOUT = 30.0
 
@@ -53,7 +55,7 @@ class SplitNNLearner(Learner):
         model: dict = None,
         analytic_sender_id: str = "analytic_sender",
         fp16: bool = True,
-        val_freq: int = 1000,
+        val_freq: int = 20,
     ):
         """Simple CIFAR-10 Trainer for split learning.
 
@@ -77,6 +79,12 @@ class SplitNNLearner(Learner):
         self.analytic_sender_id = analytic_sender_id
         self.fp16 = fp16
         self.val_freq = val_freq
+        
+        self.writer = None
+        
+        self.val_loss = []
+        self.val_labels = []
+        self.val_pred_labels = []
         
         fobs.register(TensorDecomposer)
         
@@ -119,8 +127,8 @@ class SplitNNLearner(Learner):
         self._get_model(fl_ctx=fl_ctx)
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.model = self.model.to(self.device)
-        self.optimizer = optim.SGD(self.model.parameters(), lr=self.lr, momentum=0.9)
-        self.criterion = torch.nn.CrossEntropyLoss()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        self.criterion = torch.nn.BCELoss()
         
         self.app_root = fl_ctx.get_prop(FLContextKey.APP_ROOT)
         self.client_name = fl_ctx.get_identity_name()
@@ -134,7 +142,13 @@ class SplitNNLearner(Learner):
         
         self.train_dataset = SplitNNDataset(
             root=self.dataset_root,
-            intersect_idx=list(range(1_000)),  # TODO: 
+            intersect_idx=list(range(20_000)),  # TODO: 
+            split_id=self.split_id
+        )
+        
+        self.valid_dataset = SplitNNDataset(
+            root=self.dataset_root,
+            intersect_idx=list(range(20_000, 30_000, 1)),  # TODO:
             split_id=self.split_id
         )
 
@@ -143,12 +157,20 @@ class SplitNNLearner(Learner):
             raise ValueError(f"Expected train dataset size to be larger zero but got {self.train_size}")
         self.log_info(fl_ctx, f"Training with {self.train_size}")
         
+        if self.split_id == 0:  # metrics can only be computed for client with labels
+            self.writer = parts.get(self.analytic_sender_id)  # user configured config_fed_client.json for streaming
+            if not self.writer:  # use local TensorBoard writer only
+                self.writer = SummaryWriter(self.app_root)
+        
         # register aux message handlers
         engine = fl_ctx.get_engine()
         
         if self.split_id == 0:
             engine.register_aux_message_handler(
                 topic=SplitNNConstants.TASK_TRAIN_SCB_STEP, message_handle_func=self._aux_train_scb
+            )
+            engine.register_aux_message_handler(
+                topic=SplitNNConstants.TASK_VALID_LABEL_STEP, message_handle_func=self._aux_val_scb
             )
             self.log_info(fl_ctx, f"Registered aux message handlers for split_id {self.split_id}")
         
@@ -187,9 +209,19 @@ class SplitNNLearner(Learner):
         loss = self.criterion(pred, targets)
         loss.backward()
         
+        pred_labels = (pred >= 0.5).to(torch.float32)
+        acc = (pred_labels == targets).sum() / len(targets)
+        
         self.optimizer.step()
         
         self.compute_stats_pool.record_value(category="_forward_backward_scb", value=timer() - t_start)
+        
+        # self.log_debug(fl_ctx, f"pred: {pred}, grad: {activations.grad}, target: {targets}")
+        self.log_debug(fl_ctx, f"Training loss: {loss}")
+        
+        if self.writer:
+            self.writer.add_scalar("training_loss", loss.item(), self.current_round)
+            self.writer.add_scalar("training_accuracy", acc.item(), self.current_round)
         
         return activations.grad
     
@@ -241,6 +273,71 @@ class SplitNNLearner(Learner):
 
         self.log_debug(fl_ctx, f"Sending train label return_shareable: {type(return_shareable)}")
         return return_shareable
+    
+    def _val_forward_cardx(self, batch_indices):
+        t_start = timer()
+        self.model.eval()
+        
+        inputs: torch.Tensor = self.valid_dataset.get_batch(batch_indices)
+        inputs = inputs.to(self.device)
+        
+        _val_activations: torch.Tensor = self.model.forward(inputs)
+        
+        self.compute_stats_pool.record_value(category="_val_forward_cardx", value=timer() - t_start)
+        
+        return _val_activations.detach().flatten(start_dim=1, end_dim=-1)
+    
+    def _val_forward_scb(self, batch_indices, activations, fl_ctx: FLContext):
+        t_start = timer()
+        self.model.eval()
+        
+        inputs, targets = self.valid_dataset.get_batch(batch_indices)
+        inputs = inputs.to(self.device)
+        targets = targets.to(self.device)
+        
+        activations = activations.to(self.device)
+        
+        pred = self.model.forward(inputs, activations)
+        loss = self.criterion(pred, targets)
+        
+        self.compute_stats_pool.record_value(category="_val_forward_scb", value=timer() - t_start)
+        
+        self.val_loss.append(loss.unsqueeze(0))  # unsqueeze needed for later concatenation
+
+        pred_labels = (pred >= 0.5).to(torch.float32)
+
+        self.val_pred_labels.extend(pred_labels.unsqueeze(0))
+        self.val_labels.extend(targets.unsqueeze(0))
+    
+    def _aux_val_scb(self, topic: str, request: Shareable, fl_ctx: FLContext):
+        t_start = timer()
+        
+        val_round = request.get_header(AppConstants.CURRENT_ROUND)
+        val_num_rounds = request.get_header(AppConstants.NUM_ROUNDS)
+        self.log_debug(fl_ctx, f"Validate label in round {self.current_round} of {self.num_rounds} rounds.")
+        
+        dxo = from_shareable(request)
+        if dxo.data_kind != SplitNNDataKind.ACTIVATIONS:
+            raise ValueError(f"Expected data kind {SplitNNDataKind.ACTIVATIONS} but received {dxo.data_kind}")
+
+        batch_indices = dxo.get_meta_prop(SplitNNConstants.BATCH_INDICES)
+        if batch_indices is None:
+            raise ValueError("No batch indices in DXO!")
+        
+        activations = dxo.data.get(SplitNNConstants.DATA)
+        if activations is None:
+            raise ValueError("No activations in DXO!")
+
+        self._val_forward_scb(
+            batch_indices=batch_indices, activations=fobs.loads(activations), fl_ctx=fl_ctx
+        )
+        
+        if val_round == val_num_rounds - 1:
+            self._log_validation(fl_ctx)
+        
+        self.compute_stats_pool.record_value(category="_aux_val_scb", value=timer() - t_start)
+        
+        return make_reply(ReturnCode.OK)
     
     # Model initialization task (one time only in beginning)
     def init_model(self, shareable: Shareable, fl_ctx: FLContext, abort_signal: Signal) -> Shareable:
@@ -340,7 +437,62 @@ class SplitNNLearner(Learner):
                 raise ValueError(f"No message returned from {self.other_client}!")
 
             self.log_debug(fl_ctx, f"Ending current round={self.current_round}.")
+            
+            if self.val_freq > 0:
+                if _curr_round % self.val_freq == 0:
+                    self._validate(fl_ctx)
 
         self.compute_stats_pool.record_value(category="train", value=timer() - t_start)
 
         return make_reply(ReturnCode.OK)
+    
+    def _log_validation(self, fl_ctx: FLContext):
+        if len(self.val_loss) > 0:
+            loss = torch.mean(torch.cat(self.val_loss))
+
+            _val_pred_labels = torch.cat(self.val_pred_labels)
+            _val_labels = torch.cat(self.val_labels)
+            acc = (_val_pred_labels == _val_labels).sum() / len(_val_labels)
+
+            self.log_info(
+                fl_ctx,
+                f"Round {self.current_round}/{self.num_rounds} val_loss: {loss.item():.4f}, val_accuracy: {acc.item():.4f}",
+            )
+            if self.writer:
+                self.writer.add_scalar("val_loss", loss.item(), self.current_round)
+                self.writer.add_scalar("val_accuracy", acc.item(), self.current_round)
+
+            self.val_loss = []
+            self.val_labels = []
+            self.val_pred_labels = []
+    
+    def _validate(self, fl_ctx: FLContext):
+        t_start = timer()
+        engine = fl_ctx.get_engine()
+
+        idx = np.arange(len(self.valid_dataset))
+        n_batches = int(np.ceil(len(self.valid_dataset) / self.batch_size))
+        for _val_round, _val_batch_indices in enumerate(np.array_split(idx, n_batches)):
+            activations = self._val_forward_cardx(batch_indices=_val_batch_indices)
+
+            # Site-2 label loss & accuracy
+            dxo = DXO(data={SplitNNConstants.DATA: fobs.dumps(activations)}, data_kind=SplitNNDataKind.ACTIVATIONS)
+            dxo.set_meta_prop(SplitNNConstants.BATCH_INDICES, _val_batch_indices)
+
+            data_shareable = dxo.to_shareable()
+            data_shareable.set_header(AppConstants.CURRENT_ROUND, _val_round)
+            data_shareable.set_header(AppConstants.NUM_ROUNDS, n_batches)
+            data_shareable.add_cookie(AppConstants.CONTRIBUTION_ROUND, _val_round)
+
+            # send to other side to validate
+            engine.send_aux_request(
+                targets=self.other_client,
+                topic=SplitNNConstants.TASK_VALID_LABEL_STEP,
+                request=data_shareable,
+                timeout=SplitNNConstants.TIMEOUT,
+                fl_ctx=fl_ctx,
+            )
+
+        self.compute_stats_pool.record_value(category="_validate", value=timer() - t_start)
+
+        self.log_debug(fl_ctx, "finished validation.")

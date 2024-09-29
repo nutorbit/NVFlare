@@ -12,15 +12,20 @@ class SplitNN(nn.Module):
         self.split_id = split_id
         
         self.cardx_layer = nn.Sequential(
-            nn.Linear(9, 3)
+            nn.Linear(9, 4),
+            nn.BatchNorm1d(4),
+            nn.ReLU()
         )
         
         self.scb_layer = nn.Sequential(
-            nn.Linear(6, 4)
+            nn.Linear(6, 3),
+            nn.BatchNorm1d(3),
+            nn.ReLU()
         )
         
         self.head_layer = nn.Sequential(
-            nn.Linear(3 + 4, 1)
+            nn.Linear(4 + 3, 3),
+            nn.Linear(3, 1)
         )
         
     def forward(self, x, xs=None):
@@ -29,6 +34,7 @@ class SplitNN(nn.Module):
             x = self.scb_layer(x)
             x = torch.concat([x, xs], axis=1)
             x = self.head_layer(x)
+            x = torch.sigmoid(x)
         elif self.split_id == 1:  # CardX
             x = self.cardx_layer(x)
         return x
